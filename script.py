@@ -1,67 +1,102 @@
 from github import Github
 from github.Auth import Token
-import csv, time, math
+from github.GithubException import GithubException, RateLimitExceededException
+import csv, time, os, sys
+from datetime import datetime, timezone
 from requests.exceptions import ReadTimeout, ConnectionError
-import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
-GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
-
+GITHUB_TOKEN = os.getenv('GITHUB_TOKEN') or 'SEU_TOKEN_AQUI'
 if not GITHUB_TOKEN:
     raise Exception('Defina GITHUB_TOKEN (ex.: export GITHUB_TOKEN=seu_token)')
 
+TOP_N = int(os.getenv("TOP_N", "250"))
+MAX_PRS_SCANNED = int(os.getenv("MAX_PRS_SCANNED", "50"))    
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "2"))             
+
+ABUSE_BACKOFF_BASE = float(os.getenv("ABUSE_BACKOFF_BASE", "10.0"))
+RATE_SAFETY_WINDOW = int(os.getenv("RATE_SAFETY_WINDOW", "5"))
+REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.5"))    
+
 auth = Token(GITHUB_TOKEN)
-g = Github(auth=auth)
+g = Github(auth=auth, per_page=30)  
 
-TOP_N = 200
-MAX_PRS_SCANNED = 300      # limite por repo
-DOC_EXTS = ('.md', '.rst', '.txt')
-DOC_PREFIXES = ('docs/', 'doc/')
+rate_lock = threading.Lock()
 
-def retry_call(fn, *args, retries=4, base_sleep=1.5, **kwargs):
-    """
-    Executa fn(*args, **kwargs) com retries exponenciais em erros de rede/timeout.
-    """
+def now_utc_ts():
+    return int(datetime.now(timezone.utc).timestamp())
+
+def respect_rate_limit(min_remaining=200):
+    with rate_lock:
+        try:
+            rl = g.get_rate_limit()
+            core = rl.core
+            print(f"[rate] Remaining: {core.remaining}/{core.limit}")
+            if core.remaining <= min_remaining:
+                reset_ts = int(core.reset.timestamp())
+                sleep_s = max(0, reset_ts - now_utc_ts() + RATE_SAFETY_WINDOW)
+                print(f"[rate] Atingiu limite (remaining={core.remaining}). Dormindo {sleep_s}s até reset...", flush=True)
+                time.sleep(sleep_s)
+        except Exception:
+            pass
+
+def api_call(callable_fn, *args, retries=2, base_sleep=2.0, **kwargs):
     attempt = 0
     while True:
         try:
-            return fn(*args, **kwargs)
-        except (ReadTimeout, ConnectionError) as e:
+            respect_rate_limit()
+            time.sleep(REQUEST_DELAY)
+            return callable_fn(*args, **kwargs)
+        except RateLimitExceededException:
+            print(f"[rate] Rate limit excedido oficialmente", flush=True)
+            respect_rate_limit(min_remaining=sys.maxsize)
+            continue
+        except GithubException as e:
+            if e.status == 403:
+                sleep_s = ABUSE_BACKOFF_BASE * (3 ** attempt)
+                print(f"[403] Forbidden. Backoff {sleep_s:.1f}s (tentativa {attempt+1}/{retries})", flush=True)
+                time.sleep(sleep_s)
+                attempt += 1
+                if attempt > retries:
+                    print(f"[403] Desistindo de {callable_fn.__name__} após {retries} tentativas.", flush=True)
+                    return None
+                continue
+            print(f"[GitHubException {e.status}] {e}", flush=True)
+            return None
+        except (ReadTimeout, ConnectionError):
             if attempt >= retries:
-                raise
-            sleep_s = base_sleep * (2 ** attempt)
-            time.sleep(sleep_s)
+                return None
+            time.sleep(base_sleep * (2 ** attempt))
             attempt += 1
 
 
-repos = []
-for repo in g.search_repositories(query='stars:>1000', sort='stars', order='desc'):
-    repos.append(repo)
-    if len(repos) >= TOP_N:
-        break
-
-print(f"Total de repositórios coletados (top por estrelas): {len(repos)}")
-
-linhas_csv = []
-
-for repo in repos:
-    print(f"Analisando: {repo.full_name}")
+def process_repo(repo):
     try:
-        closed_pulls = repo.get_pulls(state='closed')
-        pr_count = closed_pulls.totalCount
+        print(f"Analisando: {repo.full_name}")
+
+        closed_pulls = api_call(repo.get_pulls, state='closed', sort='updated', direction='desc')
+        if not closed_pulls:
+            return None
+
+        try:
+            pr_count = closed_pulls.totalCount
+        except Exception:
+            pr_count = 0
+
         if pr_count < 100:
             print(f"Pulando {repo.full_name} (menos de 100 PRs fechados).")
-            continue
+            return None
 
         melhor_registro = None
         maior_changed_files = -1
-        escaneados = 0
+        scanned = 0
 
         for pr in closed_pulls:
-            escaneados += 1
-            if escaneados > MAX_PRS_SCANNED:
+            scanned += 1
+            if scanned > MAX_PRS_SCANNED:
                 break
 
-            # status: merged ou closed (já é 'closed'; checamos merged para timestamp)
             if not (pr.merged or pr.state == 'closed'):
                 continue
 
@@ -73,54 +108,58 @@ for repo in repos:
             if analysis_time_hours <= 1.0:
                 continue
 
-            reviews = pr.get_reviews()
-            if reviews.totalCount == 0:
-                continue
-
-            # Ignorar PRs apenas de documentação (todos os arquivos .md/.rst/.txt ou em docs/)
-            so_docs = True
-            try:
-                files_iter = pr.get_files()
-                files_list = list(files_iter)
-                for f in files_list:
-                    path = (f.filename or "").lower()
-                    if not (path.endswith(DOC_EXTS) or path.startswith(DOC_PREFIXES)):
-                        so_docs = False
-                        break
-            except Exception:
-                # se não for possível listar arquivos, não classifica como só-doc
-                so_docs = False
-
-            if so_docs:
-                continue
-
-            num_files = getattr(pr, "changed_files", None)
-            if num_files is None:
+            num_files = getattr(pr, "changed_files", 0)
+            if num_files == 0:
                 continue
 
             if num_files > maior_changed_files:
-                lines_added  = getattr(pr, "additions", None)
+                lines_added   = getattr(pr, "additions", None)
                 lines_deleted = getattr(pr, "deletions", None)
                 description_length = len(pr.body or "")
 
-                # participantes e comentários (com retries)
                 participants = set()
                 if pr.user and pr.user.login:
                     participants.add(pr.user.login)
 
-                issue_comments = retry_call(pr.get_comments)
-                for ic in issue_comments:
-                    if ic.user and ic.user.login:
-                        participants.add(ic.user.login)
+                issue_comments = api_call(pr.get_comments)
+                issue_count = 0
+                if issue_comments:
+                    comment_count = 0
+                    for ic in issue_comments:
+                        comment_count += 1
+                        if comment_count > 50:
+                            break
+                        if ic.user and ic.user.login:
+                            participants.add(ic.user.login)
+                    try:
+                        issue_count = min(issue_comments.totalCount, 50)
+                    except Exception:
+                        issue_count = comment_count
 
-                review_comments = retry_call(pr.get_review_comments)
-                for rc in review_comments:
-                    if rc.user and rc.user.login:
-                        participants.add(rc.user.login)
+                review_comments = api_call(pr.get_review_comments)
+                review_c_count = 0
+                if review_comments:
+                    rc_count = 0
+                    for rc in review_comments:
+                        rc_count += 1
+                        if rc_count > 30:
+                            break
+                        if rc.user and rc.user.login:
+                            participants.add(rc.user.login)
+                    try:
+                        review_c_count = min(review_comments.totalCount, 30)
+                    except Exception:
+                        review_c_count = rc_count
 
-                for rv in reviews:
-                    if rv.user and rv.user.login:
-                        participants.add(rv.user.login)
+                reviews = api_call(pr.get_reviews)
+                if reviews:
+                    review_count = 0
+                    for rv in reviews:
+                        review_count += 1
+                        if review_count > 20:
+                            break
+                        if rv.user and rv.user.login:
+                            participants.add(rv.user.login)
 
                 melhor_registro = {
                     'nome': repo.full_name,
@@ -130,38 +169,58 @@ for repo in repos:
                     'analysis_time_hours': round(analysis_time_hours, 2),
                     'description_length': description_length,
                     'num_participants': len(participants),
-                    'num_comments_total': issue_comments.totalCount + review_comments.totalCount
+                    'num_comments_total': issue_count + review_c_count
                 }
                 maior_changed_files = num_files
 
-        if melhor_registro:
-            linhas_csv.append(melhor_registro)
-        else:
-            print(f"Nenhum PR válido (não-doc) encontrado em {repo.full_name}")
+        return melhor_registro
 
-    except (ReadTimeout, ConnectionError) as e:
-        print(f"Erro de rede em {repo.full_name}: {e}. Pulando após retries.")
-        continue
     except Exception as e:
         print(f"Erro em {repo.full_name}: {e}")
-        continue
+        return None
 
-# 3) Salvar CSV
-if linhas_csv:
-    campos = [
-        'nome',
-        'num_files',
-        'lines_added',
-        'lines_deleted',
-        'analysis_time_hours',
-        'description_length',
-        'num_participants',
-        'num_comments_total'
-    ]
-    with open('repos_qualificados.csv', 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=campos)
-        writer.writeheader()
-        writer.writerows(linhas_csv)
-    print(f"Arquivo repos_qualificados.csv salvo com {len(linhas_csv)} repositórios qualificados (≤ {TOP_N}).")
-else:
-    print("Nenhum repositório qualificado encontrado.")
+def main():
+    print("Coletando lista de repositórios...")
+    repos = []
+    for repo in g.search_repositories(query='stars:>1000', sort='stars', order='desc'):
+        repos.append(repo)
+        if len(repos) >= TOP_N:
+            break
+    print(f"Total de repositórios coletados: {len(repos)}")
+
+    linhas_csv = []
+    print(f"Iniciando processamento com {MAX_WORKERS} workers...")
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_name = {executor.submit(process_repo, r): r.full_name for r in repos}
+        completed = 0
+        total = len(future_to_name)
+
+        for fut in as_completed(future_to_name):
+            completed += 1
+            name = future_to_name[fut]
+            try:
+                res = fut.result()
+                if res:
+                    linhas_csv.append(res)
+                    print(f"✓ {name} — {completed}/{total}")
+                else:
+                    print(f"- {name} — {completed}/{total}")
+            except Exception as e:
+                print(f"✗ {name}: {e} — {completed}/{total}")
+
+    if linhas_csv:
+        campos = [
+            'nome', 'num_files', 'lines_added', 'lines_deleted',
+            'analysis_time_hours', 'description_length', 'num_participants', 'num_comments_total'
+        ]
+        with open('dados_coletados.csv', 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=campos)
+            writer.writeheader()
+            writer.writerows(linhas_csv)
+        print(f"✓ Salvos {len(linhas_csv)} repositórios qualificados.")
+    else:
+        print("Nenhum repositório qualificado encontrado.")
+
+if __name__ == "__main__":
+    main()
