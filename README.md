@@ -44,7 +44,17 @@ Espera-se compreender padrões de desenvolvimento, adoção de linguagens e enga
 *Um alto volume de discussões e comentários pode indicar divergências, dúvidas ou problemas, resultando em maior probabilidade de rejeição ou solicitações de mudanças.*
 
 **B. Número de Revisões:**
+5. Quanto maior o tamanho do Pull Request, maior será o número de revisões realizadas.  
+*Pull Requests que envolvem mais arquivos ou alterações tendem a demandar mais revisões para garantir a qualidade e a correção das mudanças propostas.*
 
+6. Quanto maior o tempo de análise do Pull Request, maior será o número de revisões realizadas.  
+*Pull Requests que permanecem abertos por mais tempo geralmente passam por mais ciclos de revisão, seja por ajustes solicitados ou discussões entre os revisores.*
+
+7. Quanto mais extensa for a descrição do Pull Request, menor será o número de revisões realizadas.  
+*Descrições detalhadas facilitam o entendimento das mudanças, reduzindo dúvidas e, consequentemente, a necessidade de revisões adicionais.*
+
+8. Quanto maior o número de interações no Pull Request, maior será o número de revisões realizadas.  
+*Pull Requests com mais participantes e comentários indicam maior engajamento e discussão, o que normalmente resulta em mais revisões ao longo do processo.*
 
 
 ---
